@@ -1,0 +1,290 @@
+---
+title: "(Re-)Match: CCS"
+author: "M.Kamenetsky and A.Keil"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(MatchIt)
+library(survival)
+library(dplyr)
+library(tidyr)
+
+```
+
+# Functions and Global Settings
+
+
+
+
+```{r}
+nreps <- 1000
+trueX = 1 
+
+
+#data-generating mechanisms
+
+dgmB <- function(N, intercept=0){
+  w = rnorm(N,0, 0.5)
+  el = rbinom(N,1, plogis(w))
+  x = rnorm(N,w, 0.5)
+  y = rbinom(N, 1, plogis(intercept +el  +x))
+  mean(y)
+  data.frame(el,x,y,w) # cohort data
+}
+
+
+
+dgmC<- function(N, intercept=0){
+  el = rbinom(N, 1, 0.5)
+  w = rnorm(N,el,0.5)
+  x = rnorm(N,0,0.5)
+  y = rbinom(N, 1, plogis(intercept +w+x))
+  mean(y)
+  data.frame(el,x,y,w) # cohort data
+}
+
+
+sim <- function(N,
+                incform = y ~ x -w - el,
+                nincform = y ~ x - w,
+                condform = y ~ x - strata(subclass),
+                matchform=y ~ el,
+                matchcal = c(el=0.1),
+                scenario = c("B", "C"), 
+                intercept = 0){
+  out_coefs_inc <- matrix(rep(NA, nreps), nrow=nreps) #included matching factor in model
+  out_coefs_ninc <- matrix(rep(NA, nreps), nrow=nreps)#NOT included matching factor model: 
+  out_coefs_clog <- matrix(rep(NA, nreps), nrow=nreps) #conditional logistic model (for matched ccs on matching factor)
+  
+  
+  out_ses_inc <- matrix(rep(NA, nreps), nrow=nreps)
+  out_ses_ninc <- matrix(rep(NA, nreps), nrow=nreps)
+  out_ses_clog <- matrix(rep(NA, nreps), nrow=nreps)
+  
+  out_coefs_noW <- matrix(rep(NA, nreps), nrow=nreps) 
+  out_ses_noW <- matrix(rep(NA, nreps), nrow=nreps)
+  
+  out_coefs_noWL <- matrix(rep(NA, nreps), nrow=nreps) 
+  out_ses_noWL <- matrix(rep(NA, nreps), nrow=nreps)
+  
+  
+  scenario <- match.arg(scenario)
+  for(i in 1:nreps){
+    #1) generate cohort study
+    set.seed(i+100)
+    codat = switch(scenario, 
+                   B = dgmB(N, intercept),
+                   C = dgmC(N, intercept))
+    #for each case, select a control from the same cohort who closely matches the case on key confounder
+    #sample all the cases
+    match_obj <- matchit(matchform,
+                         data=codat,
+                         replace = FALSE,
+                         ratio=1,
+                         method = "nearest",
+                         caliper=matchcal,
+                         std.caliper=FALSE,
+                         distance="euclidean"
+    )  
+    matched_data <- get_matches(match_obj, data=codat)
+    
+    #1) include matching factor in model 
+    minc = glm(incform, data=matched_data, family = binomial())
+    summary(minc)
+    out_coefs_inc[i,] <- coef(minc)[2] #this is coef and SE of X
+    out_ses_inc[i,] <- summary(minc)$coefficients[2,2]
+    
+    #2) omit matching factor from model
+    mninc = glm(nincform, data=matched_data, family = binomial())
+    summary(mninc)
+    out_coefs_ninc[i,] <- coef(mninc)[2]
+    out_ses_ninc[i,] <- summary(mninc)$coefficients[2,2]
+    
+    
+    #3) conditional logistic model, conditioning on z (matching factor)
+    mclog = clogit(condform, data=matched_data)
+    summary(mclog)
+    out_coefs_clog[i,] <- coef(mclog)[1]
+    out_ses_clog[i,] <- summary(mclog)$coefficients[1,3]
+    
+    #no W
+    mnoW <- glm(y ~ x + el, data=matched_data, family=binomial())
+    out_coefs_noW[i,] <- coef(mnoW )[2]
+    out_ses_noW[i,] <- summary(mnoW)$coefficients[2,2]
+    
+    #no W nor matching factor
+    mnoWL <- glm(y ~ x, data=matched_data, family=binomial())
+    out_coefs_noWL[i,] <- coef(mnoWL)[2]
+    out_ses_noWL[i,] <- summary(mnoWL)$coefficients[2,2]
+    
+  }
+  
+  #combine into dataframe
+  ##beta estimates
+  dat_ests <- cbind.data.frame(out_coefs_inc, out_coefs_ninc, 
+                               out_coefs_clog,out_coefs_noW, out_coefs_noWL) 
+  #standard errors
+  dat_ses <- cbind.data.frame(out_ses_inc, out_ses_ninc, out_ses_clog, out_ses_noW, out_ses_noWL) 
+  
+  colnames(dat_ests) <- c("x_inc", "x_ninc", "x_clog", "x_noW", "x_noWL")
+  dat_estsl <- dat_ests %>%
+    mutate(id = 1:nreps) %>%
+    pivot_longer(x_inc:x_noWL,names_to = "a", values_to = "est") %>%
+    separate(a, c("param","model"))
+  
+  colnames(dat_ses) <- c("x_inc", "x_ninc", "x_clog", "x_noW", "x_noWL")
+  dat_sesl <- dat_ses %>%
+    mutate(id = 1:nreps) %>%
+    pivot_longer(x_inc:x_noWL,names_to = "a", values_to = "se") %>%
+    separate(a, c("param","model"))
+  
+  ##combine
+  main <- merge(dat_estsl, dat_sesl, by=c("param","model", "id")) 
+  main_x <- main %>%
+    filter(param=="x") %>%
+    mutate(truth = trueX) %>%
+    mutate(bias = truth-est) %>%
+    mutate(mse = (truth-est)^2) %>%
+    mutate(ub = est + 1.96*se,
+           lb = est - 1.96*se) %>%
+    mutate(coverage = ifelse(truth > lb & truth < ub,1,0))
+}
+
+
+
+
+```
+
+# OR Collapsible (rare disease case)
+
+```{r}
+#Set cohort size
+N = 100000
+
+
+```
+
+## Scenario B
+
+
+```{r}
+main_B = sim(N, 
+             incform = y ~ x + el + w,
+             nincform = y ~ x + w,
+             condform = y ~ x + w + strata(subclass),
+             matchform = y ~ el,
+             matchcal = c(el=0.1),
+             scenario = "B", 
+             intercept = -6)
+
+main_B %>%
+  group_by(model) %>%
+  summarize(meanbias = mean(bias),
+            meanrmse = sqrt(mean(mse)),
+            meancoverage = mean(coverage),
+            se = sd(bias)/sqrt(nreps-1)) %>%
+  mutate(biasLB = meanbias - 1.96*se,
+         biasUB = meanbias + 1.96*se) %>%
+  relocate(model, meanbias, biasLB, biasUB) %>%
+    dplyr::mutate_at(2:4, list(~as.character(signif(., 2)))) %>%
+  knitr::kable(caption="Scenario B: Introduce new confounder W")
+
+```
+
+
+## Scenario C
+
+```{r}
+main_C = sim(N, 
+             incform = y ~ x + el + w,
+             nincform = y ~ x + w,
+             condform = y ~ x + w + strata(subclass),
+             matchform = y ~ el,
+             matchcal = c(el=0.1),
+             scenario = "C", 
+             intercept = -6)
+
+
+#main_D %>%
+main_C %>%
+  group_by(model) %>%
+  summarize(meanbias = mean(bias),
+            meanrmse = sqrt(mean(mse)),
+            meancoverage = mean(coverage),
+            se = sd(bias)/sqrt(nreps-1)) %>%
+  mutate(biasLB = meanbias - 1.96*se,
+         biasUB = meanbias + 1.96*se) %>%
+  relocate(model, meanbias, biasLB, biasUB) %>%
+    dplyr::mutate_at(2:4, list(~as.character(signif(., 2)))) %>%
+  knitr::kable(caption="Scenario C: W is child of matching factor L")
+
+```
+
+# OR NOT Collapsible (common disease)
+
+```{r}
+#Set cohort size
+N = 10000
+
+
+
+```
+
+## Scenario B
+
+```{r}
+main_B = sim(N, 
+             incform = y ~ x + el + w,
+             nincform = y ~ x + w,
+             condform = y ~ x + w + strata(subclass),
+             matchform = y ~ el,
+             matchcal = c(el=0.1),
+            #matchcal = c(el=1),
+             scenario = "B", 
+             intercept = -1.8)
+
+main_B %>%
+  group_by(model) %>%
+  summarize(meanbias = mean(bias),
+            meanrmse = sqrt(mean(mse)),
+            meancoverage = mean(coverage),
+            se = sd(bias)/sqrt(nreps-1)) %>%
+  mutate(biasLB = meanbias - 1.96*se,
+         biasUB = meanbias + 1.96*se) %>%
+  relocate(model, meanbias, biasLB, biasUB) %>%
+    dplyr::mutate_at(2:4, list(~as.character(signif(., 2)))) %>%
+  knitr::kable(caption="Scenario B: Introduce new confounder W")
+```
+
+## Scenario C
+
+```{r}
+main_C = sim(N, 
+             incform = y ~ x + el + w,
+             nincform = y ~ x + w,
+             condform = y ~ x + w + strata(subclass),
+             matchform = y ~ el,
+             matchcal = c(el=0.1),
+             scenario = "C", 
+             intercept = -1.8)
+
+
+
+main_C %>%
+  group_by(model) %>%
+  summarize(meanbias = mean(bias),
+            meanrmse = sqrt(mean(mse)),
+            meancoverage = mean(coverage),
+            se = sd(bias)/sqrt(nreps-1)) %>%
+  mutate(biasLB = meanbias - 1.96*se,
+         biasUB = meanbias + 1.96*se) %>%
+  relocate(model, meanbias, biasLB, biasUB) %>%
+    dplyr::mutate_at(2:4, list(~as.character(signif(., 2)))) %>%
+  knitr::kable(caption="Scenario C: W is child of matching factor L")
+```
+
